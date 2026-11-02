@@ -1,0 +1,20 @@
+# 构建产物
+build/
+*.obj
+*.dll
+*.exe
+*.lib
+*.exp
+*.pdb
+
+# 运行期生成
+*.log
+timelapse/
+*.mp4
+sai_path.txt
+liquify.txt
+
+# 编辑器
+.vs/
+.vscode/
+*.user
