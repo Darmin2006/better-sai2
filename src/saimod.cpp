@@ -1,4 +1,4 @@
-﻿// saimod.dll - 注入到 sai2.exe 里的"液化 / 渐变映射"悬浮面板
+// saimod.dll - 注入到 sai2.exe 里的"液化 / 渐变映射"悬浮面板
 // 说明: 不改 SAI 内部代码，只在自己的窗口里截取画布 → 处理 → 通过剪贴板写回
 #include <windows.h>
 #include <commctrl.h>
@@ -197,6 +197,10 @@ static void DoCapture(RECT sel) {
         mean = n ? (double)sum / (3.0 * n) : 0;
         Log(L"capture printwindow fallback: mean=%.1f", mean);
     }
+
+    // 屏幕抓图没有 alpha（GDI 抓出来 alpha 全 0）。必须强制不透明，
+    // 否则按 CF_DIBV5 写回时 SAI 会贴出一个全透明图层，看起来就是"空白图层"
+    for (int i = 0; i < dw * dh; i++) ((BYTE*)&g_src[i])[3] = 0xFF;
 
     memcpy(g_warp, g_src, (size_t)dw * dh * 4);
     InvalidateRect(g_canvas, NULL, FALSE);
@@ -936,6 +940,17 @@ static void WriteBack(void) {
             }
             src = tmp;
             Log(L"writeback: scaled %dx%d -> %dx%d", g_w, g_h, outW, outH);
+        }
+    }
+
+    // 兜底：如果整张图 alpha 全 0，强制不透明，避免贴出空白图层
+    {
+        BOOL anyAlpha = FALSE;
+        for (int i = 0; i < g_w * g_h && !anyAlpha; i++)
+            if (((BYTE*)&g_warp[i])[3] != 0) anyAlpha = TRUE;
+        if (!anyAlpha) {
+            for (int i = 0; i < g_w * g_h; i++) ((BYTE*)&g_warp[i])[3] = 0xFF;
+            Log(L"writeback: alpha 全 0，已强制不透明");
         }
     }
 
