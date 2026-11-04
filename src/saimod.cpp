@@ -55,6 +55,8 @@ static void Log(const wchar_t* fmt, ...) {
 #define ID_PIN      134
 #define ID_BIG      135
 #define ID_REC      136
+#define ID_SAVEDISP 137
+#define ID_APPLYDISP 138
 
 static void FreeBackup(void);
 
@@ -62,6 +64,7 @@ static HINSTANCE g_inst;
 static HWND g_sai;         // SAI 主窗口
 static HWND g_main;        // 我们的面板
 static HWND g_canvas;      // 图像预览区
+static HWND g_btnSave = NULL, g_btnApply = NULL, g_lblState = NULL;
 
 static int  g_w, g_h;      // 图像尺寸
 static int  g_origW = 0, g_origH = 0;   // 抓图时的原始尺寸（写回要还原）
@@ -134,12 +137,122 @@ static void AllocBuffers(int w, int h) {
     g_haveDisp = FALSE;
 }
 
+// ---------------- SAI 视图变换（用于"按上次区域重抓"） ----------------
+static BOOL SaiReadable(const void* p, size_t n) {
+    if (!p) return FALSE;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) return FALSE;
+    if (mbi.State != MEM_COMMIT) return FALSE;
+    if (mbi.Protect & PAGE_GUARD) return FALSE;
+    DWORD pr = mbi.Protect & 0xFF;
+    if (pr != PAGE_READWRITE && pr != PAGE_READONLY && pr != PAGE_EXECUTE_READ &&
+        pr != PAGE_EXECUTE_READWRITE) return FALSE;
+    return ((const BYTE*)p + n) <= ((const BYTE*)mbi.BaseAddress + mbi.RegionSize);
+}
+
+struct SaiViewT {
+    BOOL   ok;
+    double scale, cx, cy;
+    int    cw, ch;
+    POINT  org;
+};
+static SaiViewT g_view = { 0 };
+
+static BOOL CALLBACK FindCanvasCb(HWND h, LPARAM lp) {
+    HWND* best = (HWND*)lp;
+    wchar_t cls[64] = { 0 };
+    GetClassNameW(h, cls, 64);
+    if (_wcsicmp(cls, L"sflChildWindow") != 0) return TRUE;
+    if (!IsWindowVisible(h)) return TRUE;
+    RECT r; GetWindowRect(h, &r);
+    int a = (r.right - r.left) * (r.bottom - r.top);
+    if (a <= 0) return TRUE;
+    if (*best) {
+        RECT b; GetWindowRect(*best, &b);
+        int ba = (b.right - b.left) * (b.bottom - b.top);
+        if (a <= ba) return TRUE;
+    }
+    *best = h;
+    return TRUE;
+}
+
+static BOOL ReadSaiView(SaiViewT* v) {
+    if (!g_sai) return FALSE;
+    BYTE* b = (BYTE*)GetModuleHandleW(NULL);
+    void* doc = *(void**)(b + 0x320F18);
+    if (!SaiReadable(doc, 0x2A0)) return FALSE;
+    void* view = *(void**)((BYTE*)doc + 0x120);
+    if (!SaiReadable(view, 0x3D0)) return FALSE;
+    double cx = *(double*)((BYTE*)view + 0x378);
+    double cy = *(double*)((BYTE*)view + 0x380);
+    double sc = *(double*)((BYTE*)view + 0x3C0);
+    if (!(sc > 0.0001 && sc < 1000.0)) return FALSE;
+
+    HWND cv = NULL;
+    EnumChildWindows(g_sai, FindCanvasCb, (LPARAM)&cv);
+    if (!cv) return FALSE;
+    RECT cr; GetClientRect(cv, &cr);
+    POINT org = { 0, 0 };
+    ClientToScreen(cv, &org);
+
+    v->ok = TRUE;
+    v->scale = sc; v->cx = cx; v->cy = cy;
+    v->cw = cr.right - cr.left; v->ch = cr.bottom - cr.top;
+    v->org = org;
+    return TRUE;
+}
+
+static double Doc2ScrX(double x) { return g_view.org.x + (x - g_view.cx) / g_view.scale + g_view.cw * 0.5; }
+static double Doc2ScrY(double y) { return g_view.org.y + (y - g_view.cy) / g_view.scale + g_view.ch * 0.5; }
+static double Scr2DocX(double x) { return (x - g_view.org.x - g_view.cw * 0.5) * g_view.scale + g_view.cx; }
+static double Scr2DocY(double y) { return (y - g_view.org.y - g_view.ch * 0.5) * g_view.scale + g_view.cy; }
+
+static BOOL g_docSelValid = FALSE;
+static RECT g_docSel = { 0, 0, 0, 0 };     // 文档坐标
+
+// 按记住的文档区域重抓，缩放成 w×h
+static BOOL RecaptureSavedRegion(int w, int h) {
+    if (!g_docSelValid) return FALSE;
+    if (!ReadSaiView(&g_view)) return FALSE;
+    int sl = (int)floor(Doc2ScrX((double)g_docSel.left));
+    int st = (int)floor(Doc2ScrY((double)g_docSel.top));
+    int sr = (int)ceil(Doc2ScrX((double)g_docSel.right));
+    int sb = (int)ceil(Doc2ScrY((double)g_docSel.bottom));
+    if (sr - sl < 4 || sb - st < 4) return FALSE;
+
+    AllocBuffers(w, h);
+    ShowWindow(g_main, SW_HIDE);
+    Sleep(120);
+    HDC screen = GetDC(NULL);
+    SetStretchBltMode(g_srcDC, HALFTONE);
+    SetBrushOrgEx(g_srcDC, 0, 0, NULL);
+    BOOL ok = StretchBlt(g_srcDC, 0, 0, w, h, screen, sl, st, sr - sl, sb - st, SRCCOPY);
+    ReleaseDC(NULL, screen);
+    ShowWindow(g_main, SW_SHOW);
+    SetWindowPos(g_main, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    if (ok && g_disp) memset(g_disp, 0, (size_t)w * h * 2 * sizeof(float));
+    Log(L"recapture: doc=(%d,%d)-(%d,%d) -> screen (%d,%d)-(%d,%d) size %dx%d ok=%d",
+        g_docSel.left, g_docSel.top, g_docSel.right, g_docSel.bottom, sl, st, sr, sb, w, h, ok);
+    return ok;
+}
+
 // ---------------- 截取画布 ----------------
 static void DoCapture(RECT sel) {
     if (!g_sai) { MessageBoxW(g_main, L"没找到 SAI 窗口", L"saimod", MB_ICONWARNING); return; }
 
     int w = sel.right - sel.left, h = sel.bottom - sel.top;
     if (w < 8 || h < 8) { MessageBoxW(g_main, L"选区太小", L"saimod", MB_ICONWARNING); return; }
+
+    // 记住这次框选对应的"文档区域"，之后可按同一区域重抓（保证多图层尺寸一致）
+    if (ReadSaiView(&g_view)) {
+        g_docSel.left = (LONG)floor(Scr2DocX((double)sel.left));
+        g_docSel.top = (LONG)floor(Scr2DocY((double)sel.top));
+        g_docSel.right = (LONG)ceil(Scr2DocX((double)sel.right));
+        g_docSel.bottom = (LONG)ceil(Scr2DocY((double)sel.bottom));
+        g_docSelValid = TRUE;
+        Log(L"capture doc rect = (%d,%d)-(%d,%d)",
+            g_docSel.left, g_docSel.top, g_docSel.right, g_docSel.bottom);
+    }
 
     const int MAXSIDE = 4096;
     float s = 1.0f;
@@ -583,6 +696,77 @@ static void RenderAll(void) {
     RenderRegion(0, 0, g_w, g_h);
 }
 
+// ---------------- 多图层：记住形变 + 套用到当前抓取的图 ----------------
+static float* g_savedDisp = NULL;
+static int    g_savedW = 0, g_savedH = 0;
+
+static void SaveDispField(void) {
+    if (!g_disp || g_w <= 0 || g_h <= 0) {
+        MessageBoxW(g_main, L"还没有形变可记（先液化一下）", L"saimod", MB_ICONINFORMATION);
+        return;
+    }
+    size_t n = (size_t)g_w * g_h * 2;
+    float* p = (float*)realloc(g_savedDisp, n * sizeof(float));
+    if (!p) { MessageBoxW(g_main, L"内存不足", L"saimod", MB_ICONERROR); return; }
+    g_savedDisp = p;
+    memcpy(g_savedDisp, g_disp, n * sizeof(float));
+    g_savedW = g_w; g_savedH = g_h;
+    if (g_lblState) {
+        wchar_t s[64];
+        _snwprintf_s(s, _countof(s), _TRUNCATE, L"✓ 已记住 %dx%d", g_savedW, g_savedH);
+        SetWindowTextW(g_lblState, s);
+    }
+    MessageBoxW(g_main, L"形变已记住。\n\n接下来：\n1. 在 SAI 里切到另一个图层\n2. 选中它 → Ctrl+A → Ctrl+C\n3. 点 ② 剪贴板\n4. 点 ② 套用到当前图\n5. ④ 写回",
+                L"saimod", MB_ICONINFORMATION);
+}
+
+static void ApplyDispField(void) {
+    if (!g_savedDisp) {
+        MessageBoxW(g_main,
+            L"还没有记住形变。\n\n顺序是：\n"
+            L"1. 先在某个图层上液化\n"
+            L"2. 点 ① 记住形变\n"
+            L"3. 再切到别的图层，Ctrl+A / Ctrl+C，点 ② 剪贴板\n"
+            L"4. 最后点 ② 套用到当前图",
+            L"saimod", MB_ICONINFORMATION);
+        return;
+    }
+    // 尺寸不一致：把当前抓到的图缩放到记住的尺寸再套用（不依赖重抓）
+    if (!g_src || !g_warp) {
+        MessageBoxW(g_main,
+            L"当前没有可套用的图。\n\n请先在 SAI 里选中目标图层 → Ctrl+A → Ctrl+C → 点 ② 剪贴板，再点这个按钮。",
+            L"saimod", MB_ICONWARNING);
+        return;
+    }
+    if (g_w != g_savedW || g_h != g_savedH) {
+        int nw = g_savedW, nh = g_savedH;
+        int ow = g_w, oh = g_h;
+        uint32_t* tmp = (uint32_t*)malloc((size_t)nw * nh * 4);
+        if (!tmp) { MessageBoxW(g_main, L"内存不足", L"saimod", MB_ICONERROR); return; }
+        for (int y = 0; y < nh; y++) {
+            int sy = (int)((long long)y * oh / nh);
+            if (sy >= oh) sy = oh - 1;
+            for (int x = 0; x < nw; x++) {
+                int sx = (int)((long long)x * ow / nw);
+                if (sx >= ow) sx = ow - 1;
+                tmp[(size_t)y * nw + x] = g_src[(size_t)sy * ow + sx];
+            }
+        }
+        AllocBuffers(nw, nh);
+        if (!g_src || !g_warp || !g_disp) { free(tmp); return; }
+        memcpy(g_src, tmp, (size_t)nw * nh * 4);
+        free(tmp);
+        Log(L"[apply] 尺寸不同，已把 %dx%d 缩放为 %dx%d 再套用", ow, oh, nw, nh);
+    }
+    if (!g_disp) return;
+    memcpy(g_disp, g_savedDisp, (size_t)g_w * g_h * 2 * sizeof(float));
+    RenderAll();
+    if (g_canvas) InvalidateRect(g_canvas, NULL, FALSE);
+    HWND bw = FindWindowW(L"SaiModBig", NULL);
+    if (bw) InvalidateRect(bw, NULL, FALSE);
+    if (g_lblState) SetWindowTextW(g_lblState, L"✓ 已套用，可写回");
+}
+
 // ---------------- 笔刷 ----------------
 static float Falloff(float d, float r, float hard) {
     if (d >= r) return 0.f;
@@ -1021,7 +1205,18 @@ static void WriteBack(void) {
 // ---------------- 预览区 ----------------
 static void CanvasPaint(HDC dc, int cw, int ch) {
     RECT full = { 0, 0, cw, ch };
-    FillRect(dc, &full, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    {
+        const int CS = 12;
+        for (int y = 0; y < ch; y += CS) {
+            for (int x = 0; x < cw; x += CS) {
+                BOOL odd = (((x / CS) + (y / CS)) & 1);
+                HBRUSH br = CreateSolidBrush(odd ? RGB(200, 200, 200) : RGB(240, 240, 240));
+                RECT r = { x, y, x + CS, y + CS };
+                FillRect(dc, &r, br);
+                DeleteObject(br);
+            }
+        }
+    }
     if (!g_warp) return;
     float sx = (float)cw / g_w, sy = (float)ch / g_h;
     float s = sx < sy ? sx : sy;
@@ -1029,7 +1224,9 @@ static void CanvasPaint(HDC dc, int cw, int ch) {
     int ox = (cw - dw) / 2, oy = (ch - dh) / 2;
     SetStretchBltMode(dc, HALFTONE);
     SetBrushOrgEx(dc, 0, 0, NULL);
-    StretchBlt(dc, ox, oy, dw, dh, g_warpDC, 0, 0, g_w, g_h, SRCCOPY);
+    // 用 AlphaBlend 把 alpha 也画出来（透明区显示棋盘格，而不是黑）
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    AlphaBlend(dc, ox, oy, dw, dh, g_warpDC, 0, 0, g_w, g_h, bf);
 }
 
 static void CanvasToImage(int mx, int my, float* ix, float* iy) {
@@ -1125,7 +1322,19 @@ static void BigToImage(HWND h, int mx, int my, float* ix, float* iy) {
 }
 
 static void BigPaintRect(HWND h, HDC dc, RECT prc) {
-    FillRect(dc, &prc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    // 棋盘格背景（PS 式透明底），避免黑底把线稿吞掉
+    {
+        const int CS = 12;
+        for (int y = prc.top; y < prc.bottom; y += CS) {
+            for (int x = prc.left; x < prc.right; x += CS) {
+                BOOL odd = (((x / CS) + (y / CS)) & 1);
+                HBRUSH br = CreateSolidBrush(odd ? RGB(200, 200, 200) : RGB(240, 240, 240));
+                RECT r = { x, y, x + CS, y + CS };
+                FillRect(dc, &r, br);
+                DeleteObject(br);
+            }
+        }
+    }
     if (!g_warp) return;
 
     int dx = (int)g_bigOffX, dy = (int)g_bigOffY;
@@ -1146,8 +1355,9 @@ static void BigPaintRect(HWND h, HDC dc, RECT prc) {
 
     SetStretchBltMode(dc, HALFTONE);
     SetBrushOrgEx(dc, 0, 0, NULL);
-    StretchBlt(dc, in.left, in.top, in.right - in.left, in.bottom - in.top,
-               g_warpDC, sx, sy, sw, sh, SRCCOPY);
+    BLENDFUNCTION bf2 = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    AlphaBlend(dc, in.left, in.top, in.right - in.left, in.bottom - in.top,
+               g_warpDC, sx, sy, sw, sh, bf2);
 
     (void)h;
 }
@@ -2054,7 +2264,12 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         g_canvas = CreateWindowExW(0, L"SaiModCanvas", NULL,
                          WS_CHILD | WS_VISIBLE,
-                         10, 304, 430, 400, h, (HMENU)ID_CANVAS, g_inst, NULL);
+                         10, 304, 430, 340, h, (HMENU)ID_CANVAS, g_inst, NULL);
+
+        g_btnSave = MakeBtn(h, L"① 记住形变", ID_SAVEDISP, 10, 650, 130, 28);
+        g_btnApply = MakeBtn(h, L"② 套用到当前图", ID_APPLYDISP, 148, 650, 160, 28);
+        g_lblState = CreateWindowExW(0, L"STATIC", L"（未记住形变）", WS_CHILD | WS_VISIBLE,
+                                    316, 656, 140, 18, h, NULL, g_inst, NULL);
 
         SetTimer(h, 1, 250, NULL);
         return 0;
@@ -2091,6 +2306,18 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_TIMER: {
         static int tick = 0;
+        // 跟随 SAI 最小化：只动主面板，液化/框选进行中不干预
+        {
+            static BOOL s_min = FALSE;
+            BOOL min = (g_sai && IsWindow(g_sai)) ? IsIconic(g_sai) : FALSE;
+            if (min != s_min) {
+                s_min = min;
+                if (!g_bigWnd && !g_selWnd) {
+                    ShowWindow(g_main, min ? SW_MINIMIZE : SW_RESTORE);
+                    Log(L"[follow] panel minimize=%d", min);
+                }
+            }
+        }
         if (++tick % 8 == 0 && g_sai) {
             EnumChildWindows(g_sai, SubAll, 0);
             EnumWindows(HookTopEnum, 0);
@@ -2124,6 +2351,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (id == ID_GRESTORE) { RestoreOriginal(); return 0; }
         if (id == ID_CLIPCAP) { CaptureFromClipboard(); return 0; }
         if (id == ID_WRITEBACK) { WriteBack(); return 0; }
+        if (id == ID_SAVEDISP) { SaveDispField(); return 0; }
+        if (id == ID_APPLYDISP) { ApplyDispField(); return 0; }
         if (id == ID_UNDO) { UndoOnce(); return 0; }
         if (id == ID_RESET) {
             if (g_disp) { memset(g_disp, 0, (size_t)g_w * g_h * 2 * sizeof(float)); RenderAll(); InvalidateRect(g_canvas, NULL, FALSE); }
